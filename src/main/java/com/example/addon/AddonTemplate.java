@@ -24,6 +24,7 @@ public class AddonTemplate extends MeteorAddon {
 
         // Modules
         Modules.get().add(new ModuleExample());
+        Modules.get().add(new com.example.addon.modules.SusChunkFinder()); puis Modules.get().add(new com.example.addon.modules.PlayerBypass()); puis Modules.get().add(new com.example.addon.modules.SchematicBuilder());
 
         // Commands
         Commands.add(new CommandExample());
