@@ -1,0 +1,335 @@
+package com.example.addon.modules;
+
+import com.example.addon.AddonTemplate;
+import meteordevelopment.meteorclient.events.world.TickEvent;
+import meteordevelopment.meteorclient.settings.*;
+import meteordevelopment.meteorclient.systems.modules.Module;
+import meteordevelopment.meteorclient.utils.player.ChatUtils;
+import meteordevelopment.meteorclient.utils.player.FindItemResult;
+import meteordevelopment.meteorclient.utils.player.InvUtils;
+import meteordevelopment.meteorclient.utils.world.BlockUtils;
+import meteordevelopment.orbit.EventHandler;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.util.math.BlockPos;
+import net.minecraft.registry.Registries;
+import net.minecraft.item.BlockItem;
+import net.minecraft.block.Block;
+import net.minecraft.block.BlockState;
+
+import java.io.BufferedInputStream;
+import java.io.DataInputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.zip.GZIPInputStream;
+
+import static meteordevelopment.meteorclient.MeteorClient.mc;
+
+/**
+ * Schematic Builder : lit un fichier .litematic (le format de Litematica)
+ * et pose les blocs autour de vous.
+ *
+ * Mode d'emploi :
+ *  1. Mettez votre fichier .litematic dans le dossier  .minecraft/schematics/
+ *     (c'est le dossier habituel de Litematica).
+ *  2. Mettez dans votre barre d'action (hotbar) les blocs nécessaires.
+ *  3. Placez-vous là où doit se trouver le coin du schematic, puis
+ *     activez le module. Il pose les blocs à portée ; marchez pour avancer.
+ *
+ * Limites : orientation des blocs non gérée (escaliers, portes, bûches...),
+ * seulement les blocs de votre hotbar, ne casse rien, ne se déplace pas.
+ */
+public class SchematicBuilder extends Module {
+    private final SettingGroup sgGeneral = settings.getDefaultGroup();
+    private final SettingGroup sgPlace = settings.createGroup("Placement");
+
+    private final Setting<String> fileName = sgGeneral.add(new StringSetting.Builder()
+        .name("fichier")
+        .description("Nom du fichier dans .minecraft/schematics (ex : maison.litematic).")
+        .defaultValue("build.litematic").build());
+
+    private final Setting<Integer> offX = sgGeneral.add(new IntSetting.Builder()
+        .name("decalage-x").description("Décalage X par rapport à votre position.")
+        .defaultValue(0).sliderRange(-50, 50).build());
+
+    private final Setting<Integer> offY = sgGeneral.add(new IntSetting.Builder()
+        .name("decalage-y").description("Décalage Y par rapport à votre position.")
+        .defaultValue(0).sliderRange(-20, 20).build());
+
+    private final Setting<Integer> offZ = sgGeneral.add(new IntSetting.Builder()
+        .name("decalage-z").description("Décalage Z par rapport à votre position.")
+        .defaultValue(0).sliderRange(-50, 50).build());
+
+    private final Setting<Integer> delay = sgPlace.add(new IntSetting.Builder()
+        .name("delai-ticks").description("Ticks entre deux séries de placements.")
+        .defaultValue(2).min(1).sliderMax(20).build());
+
+    private final Setting<Integer> perCycle = sgPlace.add(new IntSetting.Builder()
+        .name("blocs-par-serie").description("Blocs posés à chaque série.")
+        .defaultValue(1).min(1).sliderMax(5).build());
+
+    private final Setting<Double> range = sgPlace.add(new DoubleSetting.Builder()
+        .name("portee").description("Distance maximale pour poser un bloc.")
+        .defaultValue(4.5).min(1).sliderMax(6).build());
+
+    private final Setting<Boolean> rotate = sgPlace.add(new BoolSetting.Builder()
+        .name("rotation").description("Tourner la tête vers le bloc posé.")
+        .defaultValue(true).build());
+
+    private record Entry(int x, int y, int z, String block) {}
+
+    private List<Entry> entries = new ArrayList<>();
+    private BlockPos origin;
+    private int timer = 0;
+    private int cycles = 0;
+    private final Set<String> warned = new HashSet<>();
+
+    public SchematicBuilder() {
+        super(AddonTemplate.CATEGORY, "schematic-builder",
+            "Pose les blocs d'un fichier .litematic autour de vous.");
+    }
+
+    @Override
+    public void onActivate() {
+        if (mc.world == null || mc.player == null) { toggle(); return; }
+
+        Path path = FabricLoader.getInstance().getGameDir()
+            .resolve("schematics").resolve(fileName.get());
+        try {
+            entries = Litematic.load(path);
+        } catch (Exception e) {
+            ChatUtils.error("Impossible de lire %s : %s", path.toString(), String.valueOf(e.getMessage()));
+            toggle();
+            return;
+        }
+        if (entries.isEmpty()) {
+            ChatUtils.warning("Le schematic est vide.");
+            toggle();
+            return;
+        }
+
+        origin = mc.player.getBlockPos().add(offX.get(), offY.get(), offZ.get());
+        warned.clear();
+        timer = 0;
+        cycles = 0;
+        ChatUtils.info("%d blocs à poser, coin en x=%d y=%d z=%d.",
+            entries.size(), origin.getX(), origin.getY(), origin.getZ());
+    }
+
+    @Override
+    public void onDeactivate() {
+        entries = new ArrayList<>();
+        warned.clear();
+    }
+
+    private static String idOf(Block block) {
+        return Registries.BLOCK.getId(block).toString();
+    }
+
+    @EventHandler
+    private void onTick(TickEvent.Post event) {
+        if (mc.world == null || mc.player == null || origin == null) return;
+        if (++timer < delay.get()) return;
+        timer = 0;
+
+        double r2 = range.get() * range.get();
+        double px = mc.player.getX();
+        double py = mc.player.getEyeY();
+        double pz = mc.player.getZ();
+
+        int placedNow = 0;
+        int remaining = 0;
+
+        for (Entry e : entries) {
+            BlockPos pos = origin.add(e.x(), e.y(), e.z());
+            BlockState current = mc.world.getBlockState(pos);
+
+            if (idOf(current.getBlock()).equals(e.block())) continue; // déjà bon
+            remaining++;
+
+            if (placedNow >= perCycle.get()) continue;
+            if (!current.isAir() && !current.isReplaceable()) continue; // obstacle
+
+            double dx = pos.getX() + 0.5 - px;
+            double dy = pos.getY() + 0.5 - py;
+            double dz = pos.getZ() + 0.5 - pz;
+            if (dx * dx + dy * dy + dz * dz > r2) continue;
+
+            final String wanted = e.block();
+            FindItemResult item = InvUtils.findInHotbar(stack ->
+                stack.getItem() instanceof BlockItem bi && idOf(bi.getBlock()).equals(wanted));
+
+            if (!item.found()) {
+                if (warned.add(wanted)) {
+                    ChatUtils.warning("Il vous manque dans la hotbar : %s", wanted);
+                }
+                continue;
+            }
+
+            if (BlockUtils.place(pos, item, rotate.get(), 50)) placedNow++;
+        }
+
+        if (remaining == 0) {
+            ChatUtils.info("Construction terminée !");
+            toggle();
+            return;
+        }
+
+        if (++cycles % 100 == 0) {
+            ChatUtils.info("Blocs restants : %d", remaining);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Lecteur de fichiers .litematic (NBT compressé en gzip)
+    // ------------------------------------------------------------------
+    private static final class Litematic {
+
+        static List<Entry> load(Path path) throws IOException {
+            Object root;
+            try (DataInputStream in = new DataInputStream(new BufferedInputStream(
+                new GZIPInputStream(Files.newInputStream(path))))) {
+                int type = in.readByte();
+                if (type != 10) throw new IOException("Fichier invalide");
+                in.readUTF(); // nom de la racine
+                root = readTag(in, 10);
+            }
+
+            Map<String, Object> rootMap = asMap(root);
+            Map<String, Object> regions = asMap(rootMap.get("Regions"));
+            if (regions == null || regions.isEmpty()) throw new IOException("Aucune région dans le fichier");
+
+            List<int[]> rawPos = new ArrayList<>();
+            List<String> rawName = new ArrayList<>();
+
+            for (Object regionObj : regions.values()) {
+                Map<String, Object> region = asMap(regionObj);
+                Map<String, Object> pos = asMap(region.get("Position"));
+                Map<String, Object> size = asMap(region.get("Size"));
+                int px = num(pos.get("x")), py = num(pos.get("y")), pz = num(pos.get("z"));
+                int sx = num(size.get("x")), sy = num(size.get("y")), sz = num(size.get("z"));
+
+                int ax = Math.abs(sx), ay = Math.abs(sy), az = Math.abs(sz);
+                int baseX = sx < 0 ? px + sx + 1 : px;
+                int baseY = sy < 0 ? py + sy + 1 : py;
+                int baseZ = sz < 0 ? pz + sz + 1 : pz;
+
+                List<?> palette = (List<?>) region.get("BlockStatePalette");
+                String[] names = new String[palette.size()];
+                for (int i = 0; i < names.length; i++) {
+                    names[i] = (String) asMap(palette.get(i)).get("Name");
+                }
+
+                long[] states = (long[]) region.get("BlockStates");
+                int bits = Math.max(2, 32 - Integer.numberOfLeadingZeros(names.length - 1));
+                long mask = (1L << bits) - 1L;
+
+                for (int y = 0; y < ay; y++) {
+                    for (int z = 0; z < az; z++) {
+                        for (int x = 0; x < ax; x++) {
+                            long index = ((long) y * az + z) * ax + x;
+                            long bitIndex = index * bits;
+                            int start = (int) (bitIndex >>> 6);
+                            int off = (int) (bitIndex & 63);
+                            long v = states[start] >>> off;
+                            if (off + bits > 64 && start + 1 < states.length) {
+                                v |= states[start + 1] << (64 - off);
+                            }
+                            int id = (int) (v & mask);
+                            if (id >= names.length) continue;
+
+                            String name = names[id];
+                            if (name.equals("minecraft:air")
+                                || name.equals("minecraft:cave_air")
+                                || name.equals("minecraft:void_air")) continue;
+
+                            rawPos.add(new int[]{baseX + x, baseY + y, baseZ + z});
+                            rawName.add(name);
+                        }
+                    }
+                }
+            }
+
+            if (rawPos.isEmpty()) return new ArrayList<>();
+
+            int minX = Integer.MAX_VALUE, minY = Integer.MAX_VALUE, minZ = Integer.MAX_VALUE;
+            for (int[] p : rawPos) {
+                minX = Math.min(minX, p[0]);
+                minY = Math.min(minY, p[1]);
+                minZ = Math.min(minZ, p[2]);
+            }
+
+            List<Entry> result = new ArrayList<>(rawPos.size());
+            for (int i = 0; i < rawPos.size(); i++) {
+                int[] p = rawPos.get(i);
+                result.add(new Entry(p[0] - minX, p[1] - minY, p[2] - minZ, rawName.get(i)));
+            }
+            // du bas vers le haut, pour que chaque bloc ait un support
+            result.sort((a, b) -> a.y() != b.y() ? Integer.compare(a.y(), b.y())
+                : a.x() != b.x() ? Integer.compare(a.x(), b.x())
+                : Integer.compare(a.z(), b.z()));
+            return result;
+        }
+
+        @SuppressWarnings("unchecked")
+        private static Map<String, Object> asMap(Object o) {
+            return (Map<String, Object>) o;
+        }
+
+        private static int num(Object o) {
+            return ((Number) o).intValue();
+        }
+
+        private static Object readTag(DataInputStream in, int type) throws IOException {
+            switch (type) {
+                case 1: return in.readByte();
+                case 2: return in.readShort();
+                case 3: return in.readInt();
+                case 4: return in.readLong();
+                case 5: return in.readFloat();
+                case 6: return in.readDouble();
+                case 7: {
+                    byte[] a = new byte[in.readInt()];
+                    in.readFully(a);
+                    return a;
+                }
+                case 8: return in.readUTF();
+                case 9: {
+                    int t = in.readByte();
+                    int n = in.readInt();
+                    List<Object> list = new ArrayList<>(Math.max(n, 0));
+                    for (int i = 0; i < n; i++) list.add(readTag(in, t));
+                    return list;
+                }
+                case 10: {
+                    Map<String, Object> map = new HashMap<>();
+                    while (true) {
+                        int t = in.readByte();
+                        if (t == 0) break;
+                        String name = in.readUTF();
+                        map.put(name, readTag(in, t));
+                    }
+                    return map;
+                }
+                case 11: {
+                    int[] a = new int[in.readInt()];
+                    for (int i = 0; i < a.length; i++) a[i] = in.readInt();
+                    return a;
+                }
+                case 12: {
+                    long[] a = new long[in.readInt()];
+                    for (int i = 0; i < a.length; i++) a[i] = in.readLong();
+                    return a;
+                }
+                default:
+                    throw new IOException("Type NBT inconnu : " + type);
+            }
+        }
+    }
+}
